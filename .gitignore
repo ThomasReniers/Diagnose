@@ -1,0 +1,9 @@
+# Diagnostic reports can contain private machine and user information.
+/reports/*
+!/reports/.gitkeep
+
+# Common temporary files
+*.log
+*.tmp
+*.bak
+*.zip
