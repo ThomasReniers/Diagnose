@@ -68,7 +68,22 @@ SOURCE
 DISCLAIMER
 ```
 
-`ISSUES` lists possible inconsistencies supported by the scan, and `TROUBLESHOOTING` suggests non-destructive next steps. JSON reports include machine-readable diagnostic data (schema version 5).
+**SUMMARY / Search** describes whether the requested program or service was identified (`CONFIRMED MATCH`, `REGISTRATION FOUND`, `POSSIBLE MATCH`, `TRACES ONLY`, or `NO MATCH FOUND`). The **Evidence level** describes the strength of that identification, not installation health.
+
+**CONCLUSION / Result** is evaluated separately:
+
+| Result | Meaning |
+| --- | --- |
+| `OK` | A confirmed match was found, no clear issues were detected in inspected sources, and the scan did not report missing coverage. This is **not** a functional or integrity test. |
+| `WARNING` | Only low-severity concerns were found, such as unverified registration or possible leftovers. |
+| `ISSUES DETECTED` | Medium- or high-severity inconsistencies were found. These are hypotheses, not proof of corruption. |
+| `INCONCLUSIVE` | The scan could not sufficiently assess the software, or one or more scan sources failed. |
+
+`CONCLUSION` presents the scan result and a concise explanation (three lines for `OK`, `WARNING`, and `ISSUES DETECTED`; four for `INCONCLUSIVE`). The same confirmed-match sentence is used when a real executable, process, package, or service was verified. If only registry entries or other indirect traces were found, the first sentence reflects that limited evidence instead of claiming a confirmed match. `INCONCLUSIVE` also suggests rephrasing the search query.
+
+`ISSUES` lists evidence-supported possible inconsistencies without bracketed status labels; `TROUBLESHOOTING` offers non-destructive next steps. JSON reports include separate `interpretation` (search match) and `assessment` (result and explanation) objects (schema version 6).
+
+**Terminal colors:** `[OK]` green, `[WARNING]` yellow, `[ISSUES DETECTED]` red, `[INCONCLUSIVE]` gray; saved reports remain uncolored.
 
 ## Project files
 

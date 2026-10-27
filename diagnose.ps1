@@ -1,6 +1,6 @@
 #requires -Version 5.1
 <##############################################################################
-  DIAGNOSE v8 - one script, two environments
+  DIAGNOSE v9.5 - one script, two environments
 
   Windows: collects read-only information about programs and services.
   Docker:  the same script turns JSON input into a readable report.
@@ -21,6 +21,42 @@ $ErrorActionPreference = 'Stop'
 function Text($Value) {
     if ($null -eq $Value) { return '' }
     return [string]$Value
+}
+
+# Show colored conclusion status on the interactive Windows terminal only.
+# Docker returns plain text; saved TXT, Markdown and JSON are never colorized.
+# Write-Host uses native console colors (no ANSI escape sequences in reports).
+function Write-TerminalReport([string]$Plain) {
+    $canColor = $false
+    try { $canColor = -not [Console]::IsOutputRedirected }
+    catch { $canColor = $false }
+
+    if (-not $canColor) {
+        # Redirected output remains complete, uncolored and pipe-friendly.
+        Write-Output $Plain
+        return
+    }
+
+    $statusColors = @{
+        'OK'              = 'Green'
+        'WARNING'         = 'DarkYellow'
+        'ISSUES DETECTED' = 'Red'
+        'INCONCLUSIVE'    = 'Gray'
+    }
+
+    foreach ($line in ($Plain -split '\r?\n')) {
+        # Match only the actual CONCLUSION result line, not other [OK] markers.
+        if ($line -match '^(\s*Result:\s*)\[(OK|WARNING|ISSUES DETECTED|INCONCLUSIVE)\](.*)$') {
+            $prefix = $Matches[1]
+            $status = $Matches[2]
+            $suffix = $Matches[3]
+            Write-Host $prefix -NoNewline
+            Write-Host ('[' + $status + ']') -ForegroundColor $statusColors[$status] -NoNewline
+            Write-Host $suffix
+        } else {
+            Write-Host $line
+        }
+    }
 }
 # No hard-coded product list. Matches start from the user's input and
 # are expanded with real executable names from registry entries and shortcuts.
@@ -324,7 +360,7 @@ function Get-WindowsReport([string]$Query, [string]$Scope) {
     $osName = ''
     try { $osName = Text (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch {}
     return [pscustomobject]@{
-        schema = 5
+        schema = 6
         query = $Query
         search_terms = @($target.terms | Select-Object -Unique)
         search_executables = @($target.executables | Select-Object -Unique)
@@ -377,7 +413,9 @@ function Get-Interpretation($R) {
     elseif ($possible) { $status = 'POSSIBLE MATCH'; $quality = 'Tentative evidence'; $explanation = 'An executable is located in a similarly named folder. Verify that it belongs to the requested application.' }
     elseif ((@($R.registry).Count + @($R.folders).Count) -gt 0) { $status = 'TRACES ONLY'; $quality = 'Weak evidence'; $explanation = 'Only similarly named registry keys or folders were found. These may be leftovers.' }
     else { $status = 'NO MATCH FOUND'; $quality = 'Not confirmed'; $explanation = 'No match was found in the inspected sources. This does NOT prove the software is absent.' }
-    if ($warnings.Count -gt 0) { $status = 'WARNING: MISSING PATHS'; $explanation += ' Check the missing paths; do not delete anything based on this scan alone.' }
+    # Search identity must never be replaced by a health warning. Missing paths
+    # are evaluated independently in ISSUES and CONCLUSION.
+
     return [pscustomobject]@{ status = $status; confidence = $quality; explanation = $explanation; warnings = @($warnings) }
 }
 # Issues are hypotheses based on observed system evidence, never a proof of corruption.
@@ -503,6 +541,60 @@ function Get-DiagnosticIssues($R) {
     return @($issues.ToArray())
 }
 
+# A confirmed search match answers *what was found*, never whether it is healthy.
+# This independent assessment considers only observed issues and scan coverage.
+# OK means "no clear issues detected by this scan", NOT a functional health test.
+function Get-Assessment($R) {
+    $issues = @($R.issues)
+    $significant = @($issues | Where-Object { $_.severity -in @('HIGH', 'MEDIUM') })
+    $minor = @($issues | Where-Object { $_.severity -eq 'LOW' })
+    $match = Text $R.interpretation.status
+    $result = ''
+    $explanation = ''
+
+    # Identify what actually matched. Incomplete registrations and leftover
+    # registry entries are not proof that an executable, package or service exists.
+    $foundLine = switch ($match) {
+        'CONFIRMED MATCH' { 'A matching file, process, package, or service was found.' }
+        'REGISTRATION FOUND' { 'A matching installation record or shortcut was found, but its executable was not verified.' }
+        'POSSIBLE MATCH' { 'A possible matching executable was found, but its identity was not verified.' }
+        'TRACES ONLY' { 'Related registry keys or folders were found, but no application or service was verified.' }
+        default { 'No matching file, process, package, or service was confirmed.' }
+    }
+
+    if ($significant.Count -gt 0) {
+        $result = 'ISSUES DETECTED'
+        $explanation = @(
+            $foundLine
+            'Potential configuration or path issues have been identified that require further review.'
+            'These issues may affect installation or normal operation. See ISSUES and TROUBLESHOOTING for details.'
+        ) -join "`n"
+    } elseif ($minor.Count -gt 0) {
+        $result = 'WARNING'
+        $explanation = @(
+            $foundLine
+            'Potential inconsistencies have been detected that require further review.'
+            'This does not confirm corruption or that the application fails to launch.'
+        ) -join "`n"
+    } elseif ($match -ne 'CONFIRMED MATCH' -or @($R.errors).Count -gt 0) {
+        $result = 'INCONCLUSIVE'
+        $explanation = @(
+            'There is insufficient reliable evidence to draw a conclusion about the current installation.'
+            'The inspected sources may be incomplete or contain only indirect matches.'
+            'This does not prove that the software is absent, damaged, or working correctly.'
+            'Try rephrasing your search query.'
+        ) -join "`n"
+    } else {
+        $result = 'OK'
+        $explanation = @(
+            $foundLine
+            'No clear configuration or path issues were detected in the inspected sources.'
+            'This does not guarantee a healthy installation or that the application launches.'
+        ) -join "`n"
+    }
+    return [pscustomobject]@{ result = $result; explanation = $explanation }
+}
+
 function Markdown-Code($value) {
     return ('`' + ((Text $value) -replace '[\r\n`]', ' ') + '`')
 }
@@ -511,9 +603,14 @@ function Render-Markdown($R) {
     $l = [System.Collections.Generic.List[string]]::new()
     $l.Add('# Diagnose: ' + $R.query)
     $l.Add('')
+    $l.Add('- **Computer:** ' + (Markdown-Code $R.computer) + ' | **OS:** ' + $R.windows)
+    $l.Add('- **Date/time:** ' + $R.created + ' | **Scan mode:** ' + $R.scope + ' | **Admin:** ' + $(if ($R.elevated) { 'yes' } else { 'no' }))
+    $l.Add('- **Search query:** ' + (Markdown-Code $R.query) + ' | **Search terms:** ' + (@($R.search_terms) -join ', '))
+    $l.Add('- **Sources:** Windows installation records, files, registry, processes, shortcuts and/or services.')
+    $l.Add('')
     $l.Add('## SUMMARY')
     $l.Add('')
-    $l.Add('**Status:** ' + $R.interpretation.status)
+    $l.Add('**Search:** ' + $R.interpretation.status)
     $l.Add('')
     $l.Add('**Evidence level:** ' + $R.interpretation.confidence)
     $l.Add('')
@@ -533,21 +630,8 @@ function Render-Markdown($R) {
 
     $l.Add('## SOURCE')
     $l.Add('')
-    $l.Add('- **Computer:** ' + (Markdown-Code $R.computer))
-    $l.Add('- **Operating system:** ' + $R.windows)
-    $l.Add('- **Date:** ' + $R.created)
-    $l.Add('- **Scan mode:** ' + $R.scope)
-    $l.Add('- **Search query:** ' + (Markdown-Code $R.query))
-    $l.Add('- **Expanded search terms:** ' + (@($R.search_terms) -join ', '))
-    $l.Add('- **Run as administrator:** ' + $(if ($R.elevated) { 'yes' } else { 'no' }))
-    $l.Add('')
-    $l.Add('Data is collected from available Windows installation records, files, processes, services, shortcuts and registry entries. Docker renders the report.')
-    $l.Add('')
-
-    $l.Add('## 2. INSTALLS')
-    $l.Add('')
     if ($R.scope -ne 'service') {
-        $l.Add('### Registered installations')
+        $l.Add('### Registered installations (' + @($R.programs).Count + ')')
         if (@($R.programs).Count -eq 0) { $l.Add('No matching installation records were found in the standard Windows locations.') }
         foreach ($x in @($R.programs)) {
             $l.Add('**' + $x.name + '**')
@@ -557,6 +641,17 @@ function Render-Markdown($R) {
             $l.Add('- Uninstall registry entry: ' + (Markdown-Code $x.registry_key))
             $l.Add('')
         }
+    }
+    if ($R.scope -ne 'program') {
+        $l.Add('### Registered Windows services (' + @($R.services).Count + ')')
+        if (@($R.services).Count -eq 0) { $l.Add('No matching Windows services were found.') }
+        foreach ($x in @($R.services)) { $l.Add('- ' + $x.display_name + ' (' + (Markdown-Code $x.name) + ')') }
+    }
+    $l.Add('')
+
+    $l.Add('## 2. INSTALLS')
+    $l.Add('')
+    if ($R.scope -ne 'service') {
         $l.Add('### Applications and executable files')
         if (@($R.applications).Count -eq 0) { $l.Add('No matching executables or executable references were found in the inspected locations.') }
         foreach ($x in @($R.applications)) {
@@ -616,19 +711,27 @@ function Render-Markdown($R) {
 
     $l.Add('## 5. CONCLUSION')
     $l.Add('')
-    $l.Add('**' + $R.interpretation.status + '** - ' + $R.interpretation.confidence)
+    $l.Add('**Result: [' + $R.assessment.result + ']**')
     $l.Add('')
-    $l.Add($R.interpretation.explanation)
-    foreach ($w in @($R.interpretation.warnings)) { $l.Add('- **Warning:** ' + $w) }
+    $conclusionLines = @((Text $R.assessment.explanation) -split '\r?\n')
+    for ($index = 0; $index -lt $conclusionLines.Count; $index++) {
+        # Two trailing spaces preserve deliberate line breaks in rendered Markdown.
+        if ($index -lt ($conclusionLines.Count - 1)) { $l.Add($conclusionLines[$index] + '  ') }
+        else { $l.Add($conclusionLines[$index]) }
+    }
     $l.Add('')
 
     $l.Add('## 6. ISSUES')
     $l.Add('')
     if (@($R.issues).Count -eq 0) {
-        $l.Add('**No clear issues detected** in the inspected information. This does not prove that all files and features work correctly.')
+        if ($R.assessment.result -eq 'INCONCLUSIVE') {
+            $l.Add('**No specific issues confirmed.** The available information was insufficient for a reliable assessment.')
+        } else {
+            $l.Add('**No clear issues detected** in the inspected information. This does not prove that all files and features work correctly.')
+        }
     } else {
         foreach ($x in @($R.issues)) {
-            $l.Add('### [' + $x.severity + '] ' + $x.title)
+            $l.Add('### ' + $x.severity + ': ' + $x.title)
             $l.Add($x.explanation)
             foreach ($e in @($x.evidence)) { $l.Add('- Evidence: ' + (Markdown-Code $e)) }
             $l.Add('')
@@ -639,11 +742,19 @@ function Render-Markdown($R) {
     $l.Add('## 7. TROUBLESHOOTING')
     $l.Add('')
     if (@($R.issues).Count -eq 0) {
-        $l.Add('**No corrective action is indicated by this scan.**')
-        $l.Add('')
-        $l.Add('1. If there is a problem, check whether the application launches or the service behaves as expected.')
-        $l.Add('2. Record the exact error and review Windows Event Viewer or the official repair options.')
-        $l.Add('3. Do not delete files, registry entries or services based solely on their counts.')
+        if ($R.assessment.result -eq 'INCONCLUSIVE') {
+            $l.Add('**The scan did not provide enough evidence to recommend a repair.**')
+            $l.Add('')
+            $l.Add('1. Retry with the complete program or service name, or search using its executable or internal service name.')
+            $l.Add('2. Review the reported scan limitations; rerun with appropriate permissions if required.')
+            $l.Add('3. Check the application or service manually and record any exact error messages.')
+        } else {
+            $l.Add('**No corrective action is indicated by this scan.**')
+            $l.Add('')
+            $l.Add('1. If there is a problem, check whether the application launches or the service behaves as expected.')
+            $l.Add('2. Record the exact error and review Windows Event Viewer or the official repair options.')
+            $l.Add('3. Do not delete files, registry entries or services based solely on their counts.')
+        }
     } else {
         $issueNumber = 0
         foreach ($x in @($R.issues)) {
@@ -662,6 +773,7 @@ function Render-Markdown($R) {
     $l.Add('## DISCLAIMER')
     $l.Add('')
     $l.Add('- The scan is read-only. No files, registry entries or services are changed.')
+    $l.Add('- Search indicates identification confidence; Result evaluates only issues visible to this scan. OK is not a guarantee of software health.')
     $l.Add('- Finding a file or registration does not prove that the software is healthy. A missing path alone does not prove file corruption.')
     $l.Add('- A stopped process or inactive service is not inherently a problem.')
     $l.Add('- This is not a full-disk scan. Portable applications and protected data may be missed.')
@@ -684,10 +796,32 @@ function Render-Report($Report) {
     $out.Add('  DIAGNOSE  |  ' + $Report.query)
     $out.Add($line)
     $out.Add('')
+    # Align both metadata columns regardless of the actual computer name,
+    # selected scan mode or search query. Keep the left column wide enough
+    # for the longest left-side value (no hard-coded machine-specific widths).
+    $metadataLeftValues = @(
+        (Text $Report.computer)
+        (Text ($Report.created.Substring(0,10)))
+        (Text $Report.scope)
+        (Text $Report.query)
+    )
+    $metadataValueWidth = 20
+    foreach ($value in $metadataLeftValues) {
+        if ($value.Length -gt $metadataValueWidth) {
+            $metadataValueWidth = $value.Length
+        }
+    }
+    $metadataFormat = '  {0,-12} : {1,-' + $metadataValueWidth + '}  |  {2,-12} : {3}'
+    $out.Add(($metadataFormat -f 'Computer', $Report.computer, 'OS', $Report.windows))
+    $out.Add(($metadataFormat -f 'Date', $Report.created.Substring(0,10), 'Time', $Report.created.Substring(11)))
+    $out.Add(($metadataFormat -f 'Scan mode', $Report.scope, 'Admin', $(if ($Report.elevated) { 'yes' } else { 'no' })))
+    $out.Add(($metadataFormat -f 'Search query', $Report.query, 'Search terms', (@($Report.search_terms) -join ', ')))
+    $out.Add(('  {0,-12} : {1}' -f 'Sources', 'Windows installation records, files, registry, processes, shortcuts and/or services.'))
+    $out.Add('')
 
     $out.Add('SUMMARY')
     $out.Add($dash)
-    $out.Add(('  Status                     : {0}' -f $Report.interpretation.status))
+    $out.Add(('  Search                     : {0}' -f $Report.interpretation.status))
     $out.Add(('  Evidence level             : {0}' -f $Report.interpretation.confidence))
     if ($Report.scope -ne 'service') {
         $out.Add(('  Installed programs         : {0}' -f $p.Count))
@@ -704,19 +838,6 @@ function Render-Report($Report) {
 
     $out.Add('SOURCE')
     $out.Add($dash)
-    $out.Add(('  Computer         : {0}' -f $Report.computer))
-    $out.Add(('  Windows          : {0}' -f $Report.windows))
-    $out.Add(('  Date             : {0}' -f $Report.created))
-    $out.Add(('  Scan mode        : {0}' -f $Report.scope))
-    $out.Add(('  Search query     : {0}' -f $Report.query))
-    $out.Add(('  Search terms     : {0}' -f (@($Report.search_terms) -join ', ')))
-    $out.Add(('  Administrator    : {0}' -f $(if ($Report.elevated) { 'yes' } else { 'no' })))
-    $out.Add('  Sources          : Windows installation records, files,')
-    $out.Add('                     registry, processes, shortcuts and/or services.')
-    $out.Add('')
-
-    $out.Add('2. INSTALLS')
-    $out.Add($dash)
     if ($Report.scope -ne 'service') {
         $out.Add(('  Registered installations ({0}):' -f $p.Count))
         if ($p.Count -eq 0) { $out.Add('    No matching installation record in the standard Windows locations.') }
@@ -730,6 +851,17 @@ function Render-Report($Report) {
             $out.Add(('    Registry    : {0}' -f $item.registry_key))
             $out.Add('')
         }
+    }
+    if ($Report.scope -ne 'program') {
+        $out.Add(('  Registered Windows services ({0}):' -f $s.Count))
+        if ($s.Count -eq 0) { $out.Add('    No matching service registration found.') }
+        foreach ($item in $s) { $out.Add(('    - {0} ({1})' -f $item.display_name, $item.name)) }
+    }
+    $out.Add('')
+
+    $out.Add('2. INSTALLS')
+    $out.Add($dash)
+    if ($Report.scope -ne 'service') {
         $out.Add(('  Applications and executables ({0}):' -f $apps.Count))
         if ($apps.Count -eq 0) { $out.Add('    No matching executable references or files found.') }
         foreach ($x in $apps) {
@@ -787,22 +919,26 @@ function Render-Report($Report) {
 
     $out.Add('5. CONCLUSION')
     $out.Add($dash)
-    $out.Add('  Status: ' + $Report.interpretation.status)
-    $out.Add('  Evidence level: ' + $Report.interpretation.confidence)
-    foreach ($x in @($Report.interpretation.warnings)) { $out.Add('  [WARNING] ' + $x) }
-    $out.Add('  ' + $Report.interpretation.explanation)
+    $out.Add('  Result: [' + $Report.assessment.result + ']')
+    foreach ($conclusionLine in @((Text $Report.assessment.explanation) -split '\r?\n')) {
+        $out.Add('  ' + $conclusionLine)
+    }
     $out.Add('')
 
     $out.Add('6. ISSUES')
     $out.Add($dash)
     if (@($Report.issues).Count -eq 0) {
-        $out.Add('  [OK] No clear issues detected in the inspected information.')
-        $out.Add('  This does not prove that all files or features work correctly.')
+        if ($Report.assessment.result -eq 'INCONCLUSIVE') {
+            $out.Add('  No specific issues confirmed; evidence was insufficient for a reliable assessment.')
+        } else {
+            $out.Add('  No clear issues detected in the inspected information.')
+            $out.Add('  This does not prove that all files or features work correctly.')
+        }
     } else {
         $issueNumber = 0
         foreach ($issue in @($Report.issues)) {
             $issueNumber++
-            $out.Add(('  {0}. [{1}] {2}' -f $issueNumber, $issue.severity, $issue.title))
+            $out.Add(('  {0}. {1}: {2}' -f $issueNumber, $issue.severity, $issue.title))
             $out.Add('     ' + $issue.explanation)
             foreach ($evidence in @($issue.evidence)) { $out.Add('     Evidence: ' + $evidence) }
             $out.Add('')
@@ -813,10 +949,17 @@ function Render-Report($Report) {
     $out.Add('7. TROUBLESHOOTING')
     $out.Add($dash)
     if (@($Report.issues).Count -eq 0) {
-        $out.Add('  No corrective action is indicated by this scan.')
-        $out.Add('  1. If it fails, test launching the application or the expected service behavior.')
-        $out.Add('  2. Record the exact error and check Windows Event Viewer.')
-        $out.Add('  3. Use official repair options; never remove entries based on counts alone.')
+        if ($Report.assessment.result -eq 'INCONCLUSIVE') {
+            $out.Add('  The scan did not provide enough evidence to recommend a repair.')
+            $out.Add('  1. Retry with a complete name, executable name, or internal service name.')
+            $out.Add('  2. Review scan limitations and rerun with appropriate permissions if needed.')
+            $out.Add('  3. Verify the application or service manually and record exact errors.')
+        } else {
+            $out.Add('  No corrective action is indicated by this scan.')
+            $out.Add('  1. If it fails, test launching the application or the expected service behavior.')
+            $out.Add('  2. Record the exact error and check Windows Event Viewer.')
+            $out.Add('  3. Use official repair options; never remove entries based on counts alone.')
+        }
     } else {
         $issueNumber = 0
         foreach ($issue in @($Report.issues)) {
@@ -835,6 +978,8 @@ function Render-Report($Report) {
     $out.Add('DISCLAIMER')
     $out.Add($dash)
     $out.Add('  - This read-only scan does not modify files, registry entries or services.')
+    $out.Add('  - Search shows identification confidence; Result evaluates inspected issues.')
+    $out.Add('  - OK is not a guarantee that the application or service works.')
     $out.Add('  - A matching file does not prove software works; a missing path is not')
     $out.Add('    proof of corruption.')
     $out.Add('  - An inactive process or stopped service is not automatically an issue.')
@@ -984,6 +1129,7 @@ try {
     $report = Get-WindowsReport -Query $query -Scope $scope
     $report | Add-Member -NotePropertyName interpretation -NotePropertyValue (Get-Interpretation $report)
     $report | Add-Member -NotePropertyName issues -NotePropertyValue @(Get-DiagnosticIssues $report)
+    $report | Add-Member -NotePropertyName assessment -NotePropertyValue (Get-Assessment $report)
     $json = ConvertTo-Json -InputObject $report -Depth 10 -Compress
 
     $reportsPath = Join-Path $PSScriptRoot 'reports'
@@ -1014,7 +1160,7 @@ try {
         catch { throw 'Docker returned an invalid report. Check: docker logs diagnose' }
         $plain = Text $rendered.text
         if (-not $plain) { throw 'No text report was received.' }
-        Write-Output $plain
+        Write-TerminalReport $plain
         if ($format) {
             $safe = ($query -replace '[^\p{L}\p{Nd}._-]', '-').Trim('-._')
             if (-not $safe) { $safe = 'query' }
